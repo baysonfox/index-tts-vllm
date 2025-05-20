@@ -1,5 +1,6 @@
 import os
 import re
+from collections import OrderedDict
 import time
 from subprocess import CalledProcessError
 import traceback
@@ -65,7 +66,7 @@ def trim_and_pad_silence(wav_data, threshold=1000, min_silence=int(24000*0.4)):
 
 class IndexTTS:
     def __init__(
-        self, cfg_path="checkpoints/config.yaml", model_dir="checkpoints", gpu_memory_utilization=0.25, is_fp16=True, device=None, use_cuda_kernel=None,
+        self, cfg_path="checkpoints/config.yaml", model_dir="checkpoints", gpu_memory_utilization=0.25, is_fp16=True, device=None, use_cuda_kernel=None, cache_size=10,
     ):
         """
         Args:
@@ -136,6 +137,9 @@ class IndexTTS:
         self.tokenizer = TextTokenizer(self.bpe_path, self.normalizer)
         print(">> bpe model loaded from:", self.bpe_path)
 
+        self.cond_mel_cache = OrderedDict()
+        self.latent_cache = OrderedDict()
+        self.cache_size = cache_size
         self.speaker_dict = {}
     
     def remove_long_silence(self, codes: list, latent: torch.Tensor, max_consecutive=15, silent_token=52):
@@ -177,13 +181,27 @@ class IndexTTS:
 
         auto_conditioning = []
         for ap_ in audio_prompt:
-            audio, sr = torchaudio.load(ap_)
-            audio = torch.mean(audio, dim=0, keepdim=True)
-            if audio.shape[0] > 1:
-                audio = audio[0].unsqueeze(0)
-            audio = torchaudio.transforms.Resample(sr, 24000)(audio)
-            cond_mel = MelSpectrogramFeatures()(audio).to(self.device)
-            # cond_mel_frame = cond_mel.shape[-1]
+            if self.cache_size > 0 and ap_ in self.cond_mel_cache:
+                cond_mel = self.cond_mel_cache[ap_]
+                self.cond_mel_cache.move_to_end(ap_)
+                if verbose:
+                    print(f"cond_mel_cache hit for {ap_}")
+            else:
+                if verbose and self.cache_size > 0:
+                    print(f"cond_mel_cache miss for {ap_}")
+                audio, sr = torchaudio.load(ap_)
+                audio = torch.mean(audio, dim=0, keepdim=True)
+                if audio.shape[0] > 1:
+                    audio = audio[0].unsqueeze(0)
+                audio = torchaudio.transforms.Resample(sr, 24000)(audio)
+                cond_mel = MelSpectrogramFeatures()(audio).to(self.device)
+                if self.cache_size > 0:
+                    self.cond_mel_cache[ap_] = cond_mel
+                    if len(self.cond_mel_cache) > self.cache_size:
+                        oldest_key = next(iter(self.cond_mel_cache))
+                        self.cond_mel_cache.popitem(last=False)
+                        if verbose:
+                            print(f"cond_mel_cache full, popped {oldest_key}")
             auto_conditioning.append(cond_mel)
 
         text_tokens_list = self.tokenizer.tokenize(text)
@@ -195,15 +213,31 @@ class IndexTTS:
         gpt_gen_time = 0
         bigvgan_time = 0
 
-        speech_conditioning_latent = []
-        for cond_mel in auto_conditioning:
-            speech_conditioning_latent_ = self.gpt.get_conditioning(
-                cond_mel,  # .half()
-                torch.tensor([cond_mel.shape[-1]], device=self.device)
-            )
-            speech_conditioning_latent.append(speech_conditioning_latent_)
-        speech_conditioning_latent = torch.stack(speech_conditioning_latent).sum(dim=0)
-        speech_conditioning_latent = speech_conditioning_latent / len(auto_conditioning)
+        latent_key = tuple(sorted(audio_prompt))
+        if self.cache_size > 0 and latent_key in self.latent_cache:
+            speech_conditioning_latent = self.latent_cache[latent_key]
+            self.latent_cache.move_to_end(latent_key)
+            if verbose:
+                print(f"latent_cache hit for {latent_key}")
+        else:
+            if verbose and self.cache_size > 0:
+                print(f"latent_cache miss for {latent_key}")
+            speech_conditioning_latent_list = []
+            for cond_mel_tensor in auto_conditioning: # Renamed from cond_mel to avoid conflict
+                speech_conditioning_latent_ = self.gpt.get_conditioning(
+                    cond_mel_tensor,  # .half()
+                    torch.tensor([cond_mel_tensor.shape[-1]], device=self.device)
+                )
+                speech_conditioning_latent_list.append(speech_conditioning_latent_)
+            speech_conditioning_latent = torch.stack(speech_conditioning_latent_list).sum(dim=0)
+            speech_conditioning_latent = speech_conditioning_latent / len(auto_conditioning)
+            if self.cache_size > 0:
+                self.latent_cache[latent_key] = speech_conditioning_latent
+                if len(self.latent_cache) > self.cache_size:
+                    oldest_key = next(iter(self.latent_cache))
+                    self.latent_cache.popitem(last=False)
+                    if verbose:
+                        print(f"latent_cache full, popped {oldest_key}")
 
         for sent in sentences:
             text_tokens = self.tokenizer.convert_tokens_to_ids(sent)

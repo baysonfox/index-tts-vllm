@@ -1,5 +1,6 @@
 import os
 import re
+from collections import OrderedDict
 import time
 from subprocess import CalledProcessError
 import traceback
@@ -28,7 +29,7 @@ from indextts.utils.front import TextNormalizer, TextTokenizer
 
 class IndexTTS:
     def __init__(
-        self, cfg_path="checkpoints/config.yaml", model_dir="checkpoints", is_fp16=True, device=None, use_cuda_kernel=None,
+        self, cfg_path="checkpoints/config.yaml", model_dir="checkpoints", is_fp16=True, device=None, use_cuda_kernel=None, cache_size=10,
     ):
         """
         Args:
@@ -98,8 +99,9 @@ class IndexTTS:
         self.tokenizer = TextTokenizer(self.bpe_path, self.normalizer)
         print(">> bpe model loaded from:", self.bpe_path)
         # 缓存参考音频mel：
-        self.cache_audio_prompt = None
-        self.cache_cond_mel = None
+        self.cond_mel_cache = OrderedDict()
+        self.latent_cache = OrderedDict()
+        self.cache_size = cache_size
         # 进度引用显示（可选）
         self.gr_progress = None
 
@@ -159,25 +161,32 @@ class IndexTTS:
             print(f"origin text:{text}")
         start_time = time.perf_counter()
 
-        # 如果参考音频改变了，才需要重新生成 cond_mel, 提升速度
-        if self.cache_cond_mel is None or self.cache_audio_prompt != audio_prompt:
+        # cond_mel caching
+        if audio_prompt in self.cond_mel_cache:
+            cond_mel = self.cond_mel_cache[audio_prompt]
+            self.cond_mel_cache.move_to_end(audio_prompt)
+            if verbose:
+                print(f"cond_mel_cache hit for {audio_prompt}")
+        else:
+            if verbose:
+                print(f"cond_mel_cache miss for {audio_prompt}")
             audio, sr = torchaudio.load(audio_prompt)
             audio = torch.mean(audio, dim=0, keepdim=True)
             if audio.shape[0] > 1:
                 audio = audio[0].unsqueeze(0)
             audio = torchaudio.transforms.Resample(sr, 24000)(audio)
             cond_mel = MelSpectrogramFeatures()(audio).to(self.device)
-            cond_mel_frame = cond_mel.shape[-1]
             if verbose:
                 print(f"cond_mel shape: {cond_mel.shape}", "dtype:", cond_mel.dtype)
-
-            self.cache_audio_prompt = audio_prompt
-            self.cache_cond_mel = cond_mel
-        else:
-            cond_mel = self.cache_cond_mel
-            cond_mel_frame = cond_mel.shape[-1]
-            pass
-
+            
+            self.cond_mel_cache[audio_prompt] = cond_mel
+            if len(self.cond_mel_cache) > self.cache_size:
+                oldest_key = next(iter(self.cond_mel_cache))
+                self.cond_mel_cache.popitem(last=False)
+                if verbose:
+                    print(f"cond_mel_cache full, popped {oldest_key}")
+        
+        cond_mel_frame = cond_mel.shape[-1]
         auto_conditioning = cond_mel
         text_tokens_list = self.tokenizer.tokenize(text)
         sentences = self.tokenizer.split_sentences(text_tokens_list)
@@ -200,10 +209,25 @@ class IndexTTS:
         gpt_gen_time = 0
         bigvgan_time = 0
 
-        speech_conditioning_latent = self.gpt.get_conditioning(
-            auto_conditioning.half(),
-            torch.tensor([auto_conditioning.shape[-1]], device=self.device)
-        )
+        # speech_conditioning_latent caching
+        if audio_prompt in self.latent_cache:
+            speech_conditioning_latent = self.latent_cache[audio_prompt]
+            self.latent_cache.move_to_end(audio_prompt)
+            if verbose:
+                print(f"latent_cache hit for {audio_prompt}")
+        else:
+            if verbose:
+                print(f"latent_cache miss for {audio_prompt}")
+            speech_conditioning_latent = self.gpt.get_conditioning(
+                auto_conditioning.half(), # cond_mel is auto_conditioning
+                torch.tensor([auto_conditioning.shape[-1]], device=self.device)
+            )
+            self.latent_cache[audio_prompt] = speech_conditioning_latent
+            if len(self.latent_cache) > self.cache_size:
+                oldest_key = next(iter(self.latent_cache))
+                self.latent_cache.popitem(last=False)
+                if verbose:
+                    print(f"latent_cache full, popped {oldest_key}")
 
         for sent in sentences:
             text_tokens = self.tokenizer.convert_tokens_to_ids(sent)
