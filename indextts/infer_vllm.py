@@ -99,14 +99,12 @@ class IndexTTS:
         self.dtype = torch.float16 if self.is_fp16 else None
         self.stop_mel_token = self.cfg.gpt.stop_mel_token
 
-        self.gpt = UnifiedVoice(gpu_memory_utilization, **self.cfg.gpt, model_dir=model_dir)
+        self.gpt = UnifiedVoice(gpu_memory_utilization, **self.cfg.gpt, model_dir=self.model_dir) # Corrected model_dir to self.model_dir
         self.gpt_path = os.path.join(self.model_dir, self.cfg.gpt_checkpoint)
         load_checkpoint(self.gpt, self.gpt_path)
         self.gpt = self.gpt.to(self.device)
-        # if self.is_fp16:
-        #     self.gpt.eval().half()
-        # else:
-        #     self.gpt.eval()
+        if self.is_fp16: # self.is_fp16 is already defined
+            self.gpt.half() 
         self.gpt.eval()
         print(">> GPT weights restored from:", self.gpt_path)
 
@@ -129,6 +127,8 @@ class IndexTTS:
         # remove weight norm on eval mode
         self.bigvgan.remove_weight_norm()
         self.bigvgan.eval()
+        if self.is_fp16: # self.is_fp16 is already defined
+            self.bigvgan.half()
         print(">> bigvgan weights restored from:", self.bigvgan_path)
         self.bpe_path = os.path.join(self.model_dir, "bpe.model")  # self.cfg.dataset["bpe_model"]
         self.normalizer = TextNormalizer()
@@ -209,9 +209,10 @@ class IndexTTS:
         sampling_rate = 24000
         # lang = "EN"
         # lang = "ZH"
-        wavs = []
+        # wavs = [] # Old list for individual wav segments
+        sentence_latents_list = [] # New list for collecting latents for batch vocoding
         gpt_gen_time = 0
-        bigvgan_time = 0
+        bigvgan_time = 0 # This will be timed once for the batch call
 
         latent_key = tuple(sorted(audio_prompt))
         if self.cache_size > 0 and latent_key in self.latent_cache:
@@ -223,10 +224,14 @@ class IndexTTS:
             if verbose and self.cache_size > 0:
                 print(f"latent_cache miss for {latent_key}")
             speech_conditioning_latent_list = []
-            for cond_mel_tensor in auto_conditioning: # Renamed from cond_mel to avoid conflict
+            for cond_mel_tensor_loop_var in auto_conditioning: # Use a different variable name
+                current_input_cond_mel = cond_mel_tensor_loop_var
+                if self.is_fp16:
+                    current_input_cond_mel = current_input_cond_mel.half()
+            
                 speech_conditioning_latent_ = self.gpt.get_conditioning(
-                    cond_mel_tensor,  # .half()
-                    torch.tensor([cond_mel_tensor.shape[-1]], device=self.device)
+                    current_input_cond_mel,
+                    torch.tensor([current_input_cond_mel.shape[-1]], device=self.device) # Use shape of potentially half-ed tensor
                 )
                 speech_conditioning_latent_list.append(speech_conditioning_latent_)
             speech_conditioning_latent = torch.stack(speech_conditioning_latent_list).sum(dim=0)
@@ -266,19 +271,45 @@ class IndexTTS:
                                 return_latent=True, clip_inputs=False)
 
                 m_start_time = time.perf_counter()
-                wav, _ = self.bigvgan(latent, [ap_.transpose(1, 2) for ap_ in auto_conditioning])
-                bigvgan_time += time.perf_counter() - m_start_time
-                wav = wav.squeeze(1)
+                # The finalized latent for the current sentence is `latent`
+                sentence_latents_list.append(latent.squeeze(0)) # Squeeze batch dim for pad_sequence
 
-                wav = torch.clamp(32767 * wav, -32767.0, 32767.0)
-                print(f"wav shape: {wav.shape}", "min:", wav.min(), "max:", wav.max())
-                # wavs.append(wav[:, :-512])
-                wavs.append(wav.cpu())  # to cpu before saving
+        # After processing all sentences, perform batch vocoding
+        if not sentence_latents_list:
+            # Handle case with no sentences/latents (e.g., empty text input)
+            wav = torch.empty(0, 0, device='cpu').float() # Or handle as an error/specific output
+            # Ensure wav is [1, T] for consistency if other parts expect it
+            if wav.dim() == 1: wav = wav.unsqueeze(0)
+            if wav.numel() == 0 : wav = wav.reshape(1,0) # for torchaudio save if path is given
+        else:
+            padded_latents = torch.nn.utils.rnn.pad_sequence(sentence_latents_list, batch_first=True, padding_value=0.0)
+            
+            final_batched_latents = padded_latents
+            final_processed_mel_refer_list = []
+
+            if self.is_fp16:
+                final_batched_latents = final_batched_latents.half()
+                final_processed_mel_refer_list = [ac_tensor.half().transpose(1, 2) for ac_tensor in auto_conditioning]
+            else:
+                final_processed_mel_refer_list = [ac_tensor.transpose(1, 2) for ac_tensor in auto_conditioning]
+
+            m_start_time = time.perf_counter()
+            batched_wav_output, _ = self.bigvgan(final_batched_latents, final_processed_mel_refer_list)
+            bigvgan_time = time.perf_counter() - m_start_time # Single timing for batch vocoder
+
+            batched_wav_output_cpu = batched_wav_output.cpu() # Shape: [B, 1, T_out]
+            individual_wavs = [batched_wav_output_cpu[i, 0, :] for i in range(batched_wav_output_cpu.shape[0])]
+            wav = torch.cat(individual_wavs, dim=0) 
+            wav = wav.unsqueeze(0) # Shape: [1, Total_T]
+            
+            wav = torch.clamp(32767 * wav, -32767.0, 32767.0) # Clamp after concatenation
+            print(f"Final batched wav shape: {wav.shape}", "min:", wav.min(), "max:", wav.max())
+
         torch.cuda.empty_cache()
         end_time = time.perf_counter()
-
-        wav = torch.cat(wavs, dim=1)
-        wav_length = wav.shape[-1] / sampling_rate
+        
+        # wav is now the fully concatenated audio on CPU
+        wav_length = wav.shape[-1] / sampling_rate if wav.numel() > 0 else 0.0
         print(f">> gpt_gen_time: {gpt_gen_time:.2f} seconds")
         print(f">> bigvgan_time: {bigvgan_time:.2f} seconds")
         print(f">> Total inference time: {end_time - start_time:.2f} seconds")
@@ -305,6 +336,13 @@ class IndexTTS:
             return (sampling_rate, wav_data)
         
     async def infer_with_ref_audio_embed(self, speaker: str, text):
+        # This method uses self.speaker_dict[speaker]["auto_conditioning"]
+        # which is already a list of processed mel tensors.
+        # It needs to be handled similarly if FP16 is desired here.
+        # However, the current subtask focuses on the main `infer` method.
+        # For completeness, one might consider if `auto_conditioning` in speaker_dict
+        # should also be stored as FP16 or converted on the fly.
+        # For now, sticking to the subtask's explicit scope.
         start_time = time.perf_counter()
         text = text.replace("嗯", "EN4")
         text = text.replace("嘿", "HEI1")
@@ -348,7 +386,21 @@ class IndexTTS:
                                 return_latent=True, clip_inputs=False)
 
                 m_start_time = time.perf_counter()
-                wav, _ = self.bigvgan(latent, [ap_.transpose(1, 2) for ap_ in auto_conditioning])
+                # Applying similar FP16 logic for infer_with_ref_audio_embed
+                current_latent_embed_for_bigvgan = latent
+                # auto_conditioning here comes from self.speaker_dict[speaker]["auto_conditioning"]
+                current_auto_conditioning_embed_tensors_for_bigvgan = auto_conditioning 
+                processed_mel_refer_list_embed_for_bigvgan = []
+
+                if self.is_fp16:
+                    current_latent_embed_for_bigvgan = current_latent_embed_for_bigvgan.half()
+                    for ac_tensor in current_auto_conditioning_embed_tensors_for_bigvgan:
+                        processed_mel_refer_list_embed_for_bigvgan.append(ac_tensor.half().transpose(1, 2))
+                else:
+                    for ac_tensor in current_auto_conditioning_embed_tensors_for_bigvgan:
+                        processed_mel_refer_list_embed_for_bigvgan.append(ac_tensor.transpose(1, 2))
+
+                wav, _ = self.bigvgan(current_latent_embed_for_bigvgan, processed_mel_refer_list_embed_for_bigvgan)
                 bigvgan_time += time.perf_counter() - m_start_time
                 wav = wav.squeeze(1)
 
@@ -386,14 +438,19 @@ class IndexTTS:
             # cond_mel_frame = cond_mel.shape[-1]
             auto_conditioning.append(cond_mel)
 
-        speech_conditioning_latent = []
-        for cond_mel in auto_conditioning:
+        speech_conditioning_latent_list_registry = [] # Renamed to avoid conflict
+        for cond_mel_reg_loop_var in auto_conditioning: # Renamed
+            current_input_cond_mel_reg = cond_mel_reg_loop_var
+            if self.is_fp16: # self.is_fp16 is available in the class scope
+                current_input_cond_mel_reg = current_input_cond_mel_reg.half()
+
             speech_conditioning_latent_ = self.gpt.get_conditioning(
-                cond_mel,  # .half()
-                torch.tensor([cond_mel.shape[-1]], device=self.device)
+                current_input_cond_mel_reg,
+                torch.tensor([current_input_cond_mel_reg.shape[-1]], device=self.device)
             )
-            speech_conditioning_latent.append(speech_conditioning_latent_)
-        speech_conditioning_latent = torch.stack(speech_conditioning_latent).sum(dim=0)
+            speech_conditioning_latent_list_registry.append(speech_conditioning_latent_)
+        # The rest of the method (stacking, averaging) uses this list, which is now correctly named
+        speech_conditioning_latent = torch.stack(speech_conditioning_latent_list_registry).sum(dim=0) 
         speech_conditioning_latent = speech_conditioning_latent / len(auto_conditioning)
 
         self.speaker_dict[speaker] = {

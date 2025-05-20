@@ -91,6 +91,8 @@ class IndexTTS:
         # remove weight norm on eval mode
         self.bigvgan.remove_weight_norm()
         self.bigvgan.eval()
+        if self.is_fp16: # self.is_fp16 is already defined based on device and input flag
+            self.bigvgan.half()
         print(">> bigvgan weights restored from:", self.bigvgan_path)
         self.bpe_path = os.path.join(self.model_dir, self.cfg.dataset["bpe_model"])
         self.normalizer = TextNormalizer()
@@ -278,7 +280,12 @@ class IndexTTS:
                 #     print(f"code len: {code_lens}")
 
                 m_start_time = time.perf_counter()
-                wav, _ = self.bigvgan(latent, auto_conditioning.transpose(1, 2))
+                current_latent = latent
+                current_auto_conditioning = auto_conditioning
+                if self.is_fp16:
+                    current_latent = current_latent.half()
+                    current_auto_conditioning = current_auto_conditioning.half()
+                wav, _ = self.bigvgan(current_latent, current_auto_conditioning.transpose(1, 2))
                 bigvgan_time += time.perf_counter() - m_start_time
                 wav = wav.squeeze(1)
 

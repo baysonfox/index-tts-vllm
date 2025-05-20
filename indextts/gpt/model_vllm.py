@@ -129,12 +129,25 @@ class UnifiedVoice(nn.Module):
             module.weight.data.normal_(mean=0.0, std=.02)
 
         # init vllm engine
-        vllm_dir = os.path.join(model_dir, "vllm")
+        original_vllm_model_path = os.path.join(model_dir, "vllm") # Existing path
+        fp8_vllm_model_path = os.path.join(model_dir, "vllm-fp8") # Assumed path for FP8 model
+
+        # Determine which model path to use.
+        target_vllm_model_path = original_vllm_model_path
+        quantization_arg = None
+        if os.path.exists(fp8_vllm_model_path):
+            print(f">> FP8 VLLM model found at {fp8_vllm_model_path}, using it.")
+            target_vllm_model_path = fp8_vllm_model_path
+            quantization_arg = "fp8"
+        else:
+            print(f">> FP8 VLLM model not found at {fp8_vllm_model_path}, using original model at {original_vllm_model_path}.")
+
         engine_args = AsyncEngineArgs(
-            model=vllm_dir,
+            model=target_vllm_model_path, # Use the determined path
             tensor_parallel_size=1,
-            dtype="auto",
+            dtype="auto", # Keep as auto
             gpu_memory_utilization=gpu_memory_utilization,
+            quantization=quantization_arg # Set quantization if using FP8 path
             # enforce_eager=True,
         )
         self.llm = AsyncLLMEngine.from_engine_args(engine_args)
