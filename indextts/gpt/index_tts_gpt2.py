@@ -19,7 +19,7 @@
 # limitations under the License.
 """Inference-only GPT-2 model compatible with HuggingFace weights."""
 from typing import (Final, Iterable, List, Literal, Mapping, Optional,
-                    Protocol, Set, Tuple, TypedDict, TypeVar, Union)
+                    Protocol, Set, Tuple, TypedDict, TypeVar, Union, Sequence)
 
 import numpy as np
 import torch
@@ -52,7 +52,7 @@ from vllm.model_executor.models.utils import (is_pp_missing_parameter,
 from vllm.model_executor.models.interfaces import SupportsMultiModal
 from vllm.multimodal.processing import (BaseMultiModalProcessor,
                                         BaseProcessingInfo, ProcessingCache,
-                                        PromptReplacement)
+                                        PromptUpdate, PromptReplacement)
 from vllm.multimodal.profiling import BaseDummyInputsBuilder, ProcessorInputs
 from vllm.multimodal.inputs import (MultiModalDataDict, MultiModalFieldConfig,
                                     MultiModalInputs, MultiModalKwargs,
@@ -66,7 +66,7 @@ class TTSProcessingInfo(BaseProcessingInfo):
 
     def get_supported_mm_limits(self) -> Mapping[str, Optional[int]]:
         # return {"audio": 2048}
-        return {}
+        return {"image": None}
 
     def get_mm_max_tokens_per_item(
         self,
@@ -74,7 +74,7 @@ class TTSProcessingInfo(BaseProcessingInfo):
         mm_counts: Mapping[str, int],
     ) -> Mapping[str, int]:
         # return {"audio": 2048}
-        return {}
+        return {"image": None}
 
 
 class TTSDummyInputsBuilder(BaseDummyInputsBuilder[TTSProcessingInfo]):
@@ -126,12 +126,12 @@ class TTSMultiModalProcessor(BaseMultiModalProcessor[TTSProcessingInfo]):
             image_embeds=MultiModalFieldConfig.batched("image"),
         )
 
-    def _get_prompt_replacements(
+    def _get_prompt_updates(
         self,
         mm_items: MultiModalDataItems,
         hf_processor_mm_kwargs: Mapping[str, object],
         out_mm_kwargs: MultiModalKwargs,
-    ) -> list[PromptReplacement]:
+    ) -> Sequence[PromptUpdate]:
         # print("mm_items:", mm_items)
         # print("hf_processor_mm_kwargs:", hf_processor_mm_kwargs)
         # print("out_mm_kwargs:", out_mm_kwargs)
@@ -187,8 +187,8 @@ class GPT2Model(nn.Module):
         self,
         input_ids: torch.Tensor,
         position_ids: torch.Tensor,
-        kv_caches: List[torch.Tensor],
-        attn_metadata: AttentionMetadata,
+        # kv_caches: List[torch.Tensor],
+        # attn_metadata: AttentionMetadata,
         intermediate_tensors: Optional[IntermediateTensors],
         inputs_embeds: Optional[torch.Tensor],
     ) -> Union[torch.Tensor, IntermediateTensors]:
@@ -203,9 +203,10 @@ class GPT2Model(nn.Module):
 
         for i in range(self.start_layer, self.end_layer):
             layer = self.h[i]
-            hidden_states = layer(hidden_states,
-                                  kv_caches[i - self.start_layer],
-                                  attn_metadata)
+            # hidden_states = layer(hidden_states,
+            #                       kv_caches[i - self.start_layer],
+            #                       attn_metadata)
+            hidden_states = layer(hidden_states)
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
@@ -269,6 +270,10 @@ class GPT2TTSModel(nn.Module, SupportsPP, SupportsMultiModal):
         self.make_empty_intermediate_tensors = (
             self.transformer.make_empty_intermediate_tensors)
 
+    def get_language_model(self) -> torch.nn.Module:
+        # Change `language_model` according to your implementation.
+        return self
+
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         # return self.transformer.get_input_embeddings(input_ids)
         return torch.zeros((input_ids.shape[0], input_ids.shape[1], self.config.n_embd))
@@ -277,8 +282,8 @@ class GPT2TTSModel(nn.Module, SupportsPP, SupportsMultiModal):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        kv_caches: List[torch.Tensor],
-        attn_metadata: AttentionMetadata,
+        # kv_caches: List[torch.Tensor],
+        # attn_metadata: AttentionMetadata,
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
         **kwargs,
@@ -302,9 +307,10 @@ class GPT2TTSModel(nn.Module, SupportsPP, SupportsMultiModal):
                 pos_emb = torch.cat(pos_emb, dim=0)
                 inputs_embeds = inputs_embeds + pos_emb
         # print("inputs_embeds", inputs_embeds.shape)
-        hidden_states = self.transformer(input_ids, positions, kv_caches,
-                                         attn_metadata, intermediate_tensors,
-                                         inputs_embeds)  # input_ids no used
+        # hidden_states = self.transformer(input_ids, positions, kv_caches,
+        #                                  attn_metadata, intermediate_tensors,
+        #                                  inputs_embeds)  # input_ids no used
+        hidden_states = self.transformer(input_ids, positions, intermediate_tensors, inputs_embeds)
         hidden_states = self.final_norm(hidden_states)
         return hidden_states
 
