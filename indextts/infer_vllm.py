@@ -66,7 +66,7 @@ def trim_and_pad_silence(wav_data, threshold=1000, min_silence=int(24000*0.4)):
 
 class IndexTTS:
     def __init__(
-        self, cfg_path="checkpoints/config.yaml", model_dir="checkpoints", gpu_memory_utilization=0.25, is_fp16=True, device=None, use_cuda_kernel=None, cache_size=10,
+        self, cfg_path="checkpoints/config.yaml", model_dir="checkpoints", gpu_memory_utilization=0.25, is_fp16=False, device=None, use_cuda_kernel=None, cache_size=10,
     ):
         """
         Args:
